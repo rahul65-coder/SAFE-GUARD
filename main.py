@@ -14,6 +14,8 @@ from telegram.ext import (
 from telegram.helpers import mention_html
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
+from flask import Flask
+from threading import Thread
 
 # Import words from words.py
 from words import abuse_words, load_additional_words
@@ -40,6 +42,16 @@ third_party_link_regex = re.compile(
 
 # Allowed domains
 allowed_domains = {"t.me", "telegram.me", "instagram.com"}
+
+# Create Flask app for uptime monitoring
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running!"
+
+def run_flask():
+    app.run(host='0.0.0.0', port=8080)
 
 async def send_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send welcome message when a new member joins"""
@@ -235,4 +247,10 @@ async def main():
     await app.run_polling()
 
 if __name__ == "__main__":
+    # Start Flask server in a separate thread
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+    
+    # Start the bot
     asyncio.run(main())
