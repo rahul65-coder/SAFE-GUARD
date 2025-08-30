@@ -16,6 +16,8 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, Forbidden
 from flask import Flask
 from threading import Thread
+from collections import defaultdict
+import time
 
 # Import words from words.py
 from words import abuse_words, load_additional_words
@@ -42,6 +44,13 @@ third_party_link_regex = re.compile(
 
 # Allowed domains
 allowed_domains = {"t.me", "telegram.me", "instagram.com"}
+
+# User warning tracking - {chat_id: {user_id: warning_count}}
+user_warnings = defaultdict(lambda: defaultdict(int))
+
+# Cache for performance optimization
+permission_cache = {}
+last_permission_check = {}
 
 # Create Flask app for uptime monitoring
 app = Flask(__name__)
@@ -115,6 +124,149 @@ def is_allowed_link(url):
             return True
     return False
 
+async def check_bot_permissions(chat, context):
+    """Check if bot has admin permissions with caching for performance"""
+    current_time = time.time()
+    cache_key = f"{chat.id}_{context.bot.id}"
+    
+    # Check cache first (valid for 5 minutes)
+    if cache_key in permission_cache and current_time - last_permission_check.get(cache_key, 0) < 300:
+        return permission_cache[cache_key]
+    
+    try:
+        bot_member = await chat.get_member(context.bot.id)
+        has_permissions = bot_member.can_restrict_members and bot_member.can_delete_messages
+        permission_cache[cache_key] = has_permissions
+        last_permission_check[cache_key] = current_time
+        return has_permissions
+    except Exception as e:
+        logger.error(f"Error checking bot permissions: {e}")
+        permission_cache[cache_key] = False
+        last_permission_check[cache_key] = current_time
+        return False
+
+async def handle_abuse(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+    """Handle abusive language with 3-level warning system"""
+    user = update.effective_user
+    chat = update.effective_chat
+    user_id = user.id
+    chat_id = chat.id
+    
+    # Check for abusive words
+    found_abuses = []
+    for word in abuse_words:
+        if re.search(r'\b' + re.escape(word) + r'\b', text):
+            found_abuses.append(word)
+    
+    if not found_abuses:
+        return False
+    
+    try:
+        # Delete the abusive message
+        await update.message.delete()
+        logger.info(f"Deleted abusive message from {user.full_name}: {text}")
+        
+        # Increment warning count
+        user_warnings[chat_id][user_id] += 1
+        warning_level = user_warnings[chat_id][user_id]
+        
+        # Take action based on warning level
+        if warning_level == 1:
+            # Level 1: Warning only
+            mute_msg = await context.bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    f"⚠️ <b>Warning Level 1</b>\n\n"
+                    f"👤 <b>User:</b> {mention_html(user.id, user.full_name)}\n"
+                    f"📝 <b>Reason:</b> Abusive Language\n"
+                    f"❌ <b>Detected Words:</b> {', '.join(found_abuses[:3])}{'...' if len(found_abuses) > 3 else ''}\n\n"
+                    f"<i>Next violation will result in a 30-minute mute.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            await asyncio.sleep(10)
+            await mute_msg.delete()
+            
+        elif warning_level == 2:
+            # Level 2: 30-minute mute
+            until_date = update.message.date + timedelta(minutes=30)
+            await chat.restrict_member(
+                user.id,
+                ChatPermissions(can_send_messages=False),
+                until_date=until_date,
+            )
+            logger.info(f"Muted user {user.full_name} for 30 minutes")
+            
+            mute_msg = await context.bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    f"🚫 <b>Warning Level 2</b>\n\n"
+                    f"👤 <b>User:</b> {mention_html(user.id, user.full_name)}\n"
+                    f"⏰ <b>Duration:</b> 30 Minutes Mute\n"
+                    f"📝 <b>Reason:</b> Abusive Language\n"
+                    f"❌ <b>Detected Words:</b> {', '.join(found_abuses[:3])}{'...' if len(found_abuses) > 3 else ''}\n\n"
+                    f"<i>Next violation will result in a 2-hour mute.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            await asyncio.sleep(10)
+            await mute_msg.delete()
+            
+        elif warning_level >= 3:
+            # Level 3: 2-hour mute
+            until_date = update.message.date + timedelta(hours=2)
+            await chat.restrict_member(
+                user.id,
+                ChatPermissions(can_send_messages=False),
+                until_date=until_date,
+            )
+            logger.info(f"Muted user {user.full_name} for 2 hours")
+            
+            # Reset warning count after level 3
+            user_warnings[chat_id][user_id] = 0
+            
+            mute_msg = await context.bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    f"🔇 <b>Warning Level 3</b>\n\n"
+                    f"👤 <b>User:</b> {mention_html(user.id, user.full_name)}\n"
+                    f"⏰ <b>Duration:</b> 2 Hours Mute\n"
+                    f"📝 <b>Reason:</b> Abusive Language\n"
+                    f"❌ <b>Detected Words:</b> {', '.join(found_abuses[:3])}{'...' if len(found_abuses) > 3 else ''}\n\n"
+                    f"<i>Warning counter has been reset.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            await asyncio.sleep(10)
+            await mute_msg.delete()
+        
+        return True
+        
+    except BadRequest as e:
+        logger.error(f"Couldn't mute user or delete message: {e}")
+        # Try to send a warning even if we can't mute
+        try:
+            warning_msg = await context.bot.send_message(
+                chat_id=chat.id,
+                text=(
+                    f"⚠️ <b>Warning</b>\n\n"
+                    f"👤 {mention_html(user.id, user.full_name)}\n"
+                    f"❌ Used abusive language!\n\n"
+                    f"<i>This behavior is not allowed.</i>"
+                ),
+                parse_mode=ParseMode.HTML,
+            )
+            await asyncio.sleep(10)
+            await warning_msg.delete()
+        except Exception as e2:
+            logger.error(f"Couldn't send warning message: {e2}")
+    except Forbidden as e:
+        logger.error(f"Bot doesn't have permission to restrict user: {e}")
+    except Exception as e:
+        logger.error(f"Unexpected error handling abuse: {e}")
+    
+    return False
+
 async def monitor_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Monitor messages for abuse and third-party links"""
     try:
@@ -129,73 +281,15 @@ async def monitor_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.is_bot:
             return
             
-        # Check if bot has admin permissions
-        try:
-            bot_member = await chat.get_member(context.bot.id)
-            if not bot_member.can_restrict_members or not bot_member.can_delete_messages:
-                logger.warning(f"Bot doesn't have required permissions in chat {chat.title}")
-                return
-        except Exception as e:
-            logger.error(f"Error checking bot permissions: {e}")
+        # Check if bot has admin permissions (with caching for performance)
+        if not await check_bot_permissions(chat, context):
+            logger.warning(f"Bot doesn't have required permissions in chat {chat.title}")
             return
         
         # Check for abusive words
-        for word in abuse_words:
-            if re.search(r'\b' + re.escape(word) + r'\b', text):
-                try:
-                    # Delete the abusive message
-                    await update.message.delete()
-                    logger.info(f"Deleted abusive message from {user.full_name}: {text}")
-                    
-                    # Mute user for 2 hours
-                    until_date = update.message.date + timedelta(hours=2)
-                    await chat.restrict_member(
-                        user.id,
-                        ChatPermissions(can_send_messages=False),
-                        until_date=until_date,
-                    )
-                    logger.info(f"Muted user {user.full_name} for 2 hours")
-                    
-                    # Send stylish warning message
-                    mute_msg = await context.bot.send_message(
-                        chat_id=chat.id,
-                        text=(
-                            f"🚫 <b>Action Taken</b>\n\n"
-                            f"👤 <b>User:</b> {mention_html(user.id, user.full_name)}\n"
-                            f"⏰ <b>Duration:</b> 2 Hours Mute\n"
-                            f"📝 <b>Reason:</b> Abusive Language\n\n"
-                            f"<i>Please maintain respectful conversation.</i>"
-                        ),
-                        parse_mode=ParseMode.HTML,
-                    )
-                    
-                    # Delete warning after 30 seconds
-                    await asyncio.sleep(30)
-                    await mute_msg.delete()
-                    
-                except BadRequest as e:
-                    logger.error(f"Couldn't mute user or delete message: {e}")
-                    # Try to send a warning even if we can't mute
-                    try:
-                        warning_msg = await context.bot.send_message(
-                            chat_id=chat.id,
-                            text=(
-                                f"⚠️ <b>Warning</b>\n\n"
-                                f"👤 {mention_html(user.id, user.full_name)}\n"
-                                f"❌ Used abusive language!\n\n"
-                                f"<i>This behavior is not allowed.</i>"
-                            ),
-                            parse_mode=ParseMode.HTML,
-                        )
-                        await asyncio.sleep(30)
-                        await warning_msg.delete()
-                    except Exception as e2:
-                        logger.error(f"Couldn't send warning message: {e2}")
-                except Forbidden as e:
-                    logger.error(f"Bot doesn't have permission to restrict user: {e}")
-                except Exception as e:
-                    logger.error(f"Unexpected error handling abuse: {e}")
-                return
+        abuse_detected = await handle_abuse(update, context, text)
+        if abuse_detected:
+            return
 
         # Check for third-party links
         if third_party_link_regex.search(text):
@@ -236,13 +330,14 @@ async def monitor_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def main():
     """Start the bot"""
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    # Use connection pooling for better performance with multiple groups
+    app = ApplicationBuilder().token(BOT_TOKEN).pool_timeout(30).read_timeout(30).write_timeout(30).build()
     
     # Add handlers
     app.add_handler(ChatMemberHandler(send_welcome, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, monitor_message))
     
-    logger.info("Bot started with stylish messages and abuse detection...")
+    logger.info("Bot started with 3-level warning system and enhanced performance...")
     logger.info(f"Monitoring for {len(abuse_words)} abuse words")
     await app.run_polling()
 
@@ -252,5 +347,12 @@ if __name__ == "__main__":
     flask_thread.daemon = True
     flask_thread.start()
     
-    # Start the bot
-    asyncio.run(main())
+    # Start the bot with optimized event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        loop.close()
