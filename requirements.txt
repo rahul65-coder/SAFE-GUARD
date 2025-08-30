@@ -1,4 +1,5 @@
-python-telegram-bot==20.3
-firebase-admin==6.4.0
-nest_asyncio
-Flask==2.3.3
+python-telegram-bot==20.7
+Flask==3.0.0
+nest-asyncio==1.5.8
+aiohttp==3.9.1
+requests==2.31.0
